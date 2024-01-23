@@ -13,6 +13,8 @@ import com.google.appinventor.components.runtime.util.YailList;
 import com.bosonshiggs.physicsengine.helpers.Vector2D;
 import com.bosonshiggs.physicsengine.helpers.PhysicsObject;
 import com.bosonshiggs.physicsengine.helpers.Camera;
+import com.bosonshiggs.physicsengine.helpers.Container;
+import com.bosonshiggs.physicsengine.helpers.FollowInfo;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -63,11 +65,15 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
     private Map<Integer, PhysicsObject> objects = new HashMap<>();
     private HashMap<Integer, String> objectToLayerMap = new HashMap<>();
     private HashMap<String, Runnable> animationTasks = new HashMap<>();
+    private Map<Integer, Container> containers = new HashMap<>();
+    
+    // Mapa para armazenar os objetos que estão seguindo outros objetos
+    private Map<Integer, FollowInfo> followingObjects = new HashMap<>();
 
     private Vector2D gravity = new Vector2D(0, 9.8f);
     
     private String LOG_NAME = "PhysicsEngine";
-    private boolean flagLog = true;
+    private boolean flagLog = false;
     
     // Pool de threads para melhorar a eficiência
     private ExecutorService collisionExecutor = Executors.newSingleThreadExecutor();    
@@ -106,6 +112,8 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
     private Camera camera;
     
     private boolean isParallaxEnabled = true;
+        
+    private ExecutorService executor = Executors.newSingleThreadExecutor();
     
     public PhysicsEngine(ComponentContainer container) {
         super(container.$form());
@@ -270,7 +278,7 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
                 }
             }
             
-         // Atualiza o efeito de paralaxe para todas as camadas
+            // Atualiza o efeito de paralaxe para todas as camadas
             if (this.isParallaxEnabled) {
 	            for (Layer layer : layerMap.values()) {
 	                if (layer.parallaxIntensity > 0.0f) {
@@ -279,9 +287,11 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
 	            }
             }
             
+            updateFollowing(deltaTime); // Atualiza o seguimento dos objetos
+            
             OnUpdate();
         } catch (Exception e) {
-            Log.e(LOG_NAME, "Erro na atualização da física: " + e.getMessage());
+            if (flagLog) Log.e(LOG_NAME, "Erro na atualização da física: " + e.getMessage());
         }
     }
 
@@ -386,12 +396,12 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
             final float jumpForce = jumpStrength * obj.getMass();
             obj.applyForce(new Vector2D(0, jumpForce));
 
-            Log.d(LOG_NAME, "Salto iniciado com força: " + jumpForce);
+            if (flagLog) Log.d(LOG_NAME, "Salto iniciado com força: " + jumpForce);
 
             new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
                 @Override
                 public void run() {
-                    Log.d(LOG_NAME, "Finalizando salto para o objeto: " + id);
+                	if (flagLog) Log.d(LOG_NAME, "Finalizando salto para o objeto: " + id);
                     obj.applyForce(new Vector2D(0, 0));
                 }
             }, durationMs);
@@ -1170,6 +1180,128 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
     /*
      * END CAMERA
      */
+    
+    @SimpleFunction(description = "Creates a tilemap by replicating an image nx by ny times.")
+    public void CreateTileMap(String layerName, String imagePath, int nx, int ny) {
+        try {
+            if (!layerMap.containsKey(layerName)) {
+                ReportError("Layer not found: " + layerName);
+                return;
+            }
+
+            Drawable drawable = MediaUtil.getBitmapDrawable(container.$form(), imagePath);
+            Bitmap tileBitmap = ((BitmapDrawable) drawable).getBitmap();
+
+            Layer layer = layerMap.get(layerName);
+            android.graphics.Canvas canvas = new android.graphics.Canvas(layer.bitmap);
+
+            for (int x = 0; x < nx; x++) {
+                for (int y = 0; y < ny; y++) {
+                    canvas.drawBitmap(tileBitmap, x * tileBitmap.getWidth(), y * tileBitmap.getHeight(), null);
+                }
+            }
+
+            RedrawCanvas(-1, showCollisionBoxes);
+        } catch (Exception e) {
+            ReportError("Error creating tilemap: " + e.getMessage());
+        }
+    }
+    
+    @SimpleFunction(description = "Oscillates an object horizontally.")
+    public void OscillateObjectHorizontally(int objectId, float amplitude, long oscillationTime) {
+        PhysicsObject obj = objects.get(objectId);
+        if (obj != null) {
+            obj.startOscillatingHorizontally(amplitude, oscillationTime);
+        } else {
+        	ReportError("Error! The object was not found!");
+        }
+    }
+
+    @SimpleFunction(description = "Oscillates an object vertically.")
+    public void OscillateObjectVertically(int objectId, float amplitude, long oscillationTime) {
+        PhysicsObject obj = objects.get(objectId);
+        if (obj != null) {
+            obj.startOscillatingVertically(amplitude, oscillationTime);
+        } else {
+        	ReportError("Error! The object was not found!");
+        }
+    }
+    
+    @SimpleFunction(description = "Creates a new container with the specified parent object.")
+    public void CreateContainer(int parentId) {
+        PhysicsObject parent = objects.get(parentId);
+        if (parent != null) {
+            Container container = new Container(parent);
+            containers.put(parentId, container);
+        }
+    }
+
+    @SimpleFunction(description = "Adds a child object to the specified container.")
+    public void AddChildToContainer(int containerId, int childId) {
+        Container container = containers.get(containerId);
+        PhysicsObject child = objects.get(childId);
+        if (container != null && child != null) {
+            container.addChild(child);
+        }
+    }
+
+    @SimpleFunction(description = "Removes a child object from the specified container.")
+    public void RemoveChildFromContainer(int containerId, int childId) {
+        Container container = containers.get(containerId);
+        PhysicsObject child = objects.get(childId);
+        if (container != null && child != null) {
+            container.removeChild(child);
+        }
+    }
+    
+    
+    /*
+     * Following
+     */
+    @SimpleFunction(description = "Make an object follow another object within a specific distance.")
+    public void StartFollowing(int followerId, int leaderId, float maxFollowDistance, float stopFollowDistance) {
+        followingObjects.put(followerId, new FollowInfo(followerId, leaderId, maxFollowDistance, stopFollowDistance));
+    }
+
+    private void updateFollowing(float deltaTime) {
+        for (FollowInfo followInfo : followingObjects.values()) {
+            PhysicsObject follower = objects.get(followInfo.getFollowerId());
+            PhysicsObject leader = objects.get(followInfo.getLeaderId());
+
+            if (follower == null || leader == null) {
+                continue;
+            }
+
+            Vector2D followerPos = follower.getPosition();
+            Vector2D leaderPos = leader.getPosition();
+            float distance = Vector2D.distance(followerPos, leaderPos);
+
+            if (distance <= followInfo.getMaxFollowDistance() && distance > followInfo.getStopFollowDistance()) {
+                Vector2D direction = new Vector2D(leaderPos.x - followerPos.x, leaderPos.y - followerPos.y);
+                direction.normalize();
+
+                // Certifique-se de que getSpeed() está definido em PhysicsObject
+                float speed = follower.getSpeed(); 
+
+                follower.setVelocity(new Vector2D(direction.x * speed, direction.y * speed));
+            } else if (distance > followInfo.getMaxFollowDistance()) {
+                follower.setVelocity(new Vector2D(0, 0));
+            }
+        }
+    }
+
+    public void updateFollowingAsync(final float deltaTime) {
+        executor.submit(new Runnable() {
+            @Override
+            public void run() {
+                updateFollowing(deltaTime);
+            }
+        });
+    }
+    /*
+     * END FOLLOWING
+     */
+    
 
     /*
      * EVENTS
@@ -1363,7 +1495,7 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
             return layer.bitmap;
         } else {
             // Manipular o caso em que a camada não é encontrada
-            Log.e(LOG_NAME, "Camada não encontrada: " + layerName);
+        	if (flagLog) Log.e(LOG_NAME, "Camada não encontrada: " + layerName);
             return null;
         }
     }

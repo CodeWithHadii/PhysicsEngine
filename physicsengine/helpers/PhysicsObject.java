@@ -23,7 +23,21 @@ public class PhysicsObject {
     private static final float EPSILON = 0.5f;
     
     private String LOG_NAME = "PhysicsEngine";
-    private boolean flagLog = false;
+    private boolean flagLog = true;
+    
+    private boolean isOscillatingHorizontally = false;
+    private boolean isOscillatingVertically = false;
+    private float oscillationAmplitudeX;
+    private float oscillationAmplitudeY;
+    private float oscillationFrequencyX;
+    private float oscillationFrequencyY;
+    private float initialPosX;
+    private float initialPosY;
+    private long startTime;
+    
+    //Conteiner
+    private Container container;
+    private Vector2D containerOffset; // Offset relativo à posição do pai
 
     public PhysicsObject(float x, float y, float width, float height, float mass, float friction) {
         this.position = new Vector2D(x, y);
@@ -53,11 +67,23 @@ public class PhysicsObject {
 
     public void update(float deltaTime) {
         applyFriction();
+        
+        long elapsedTime = System.currentTimeMillis() - startTime;
+        if (isOscillatingHorizontally ) {
+            float newX = initialPosX + oscillationAmplitudeX * (float)Math.sin(oscillationFrequencyX * elapsedTime);
+            if (flagLog) Log.d(LOG_NAME, "xPosOscillatingH: " + newX);
+            setPosition(new Vector2D(newX, position.y));
+        }
 
+        if (isOscillatingVertically) {
+            float newY = initialPosY + oscillationAmplitudeY * (float)Math.sin(oscillationFrequencyY * elapsedTime);
+            if (flagLog) Log.d(LOG_NAME, "yPosOscillatingV: " + newY);
+            setPosition(new Vector2D(position.x, newY));
+        }
+        
         // Verifique se a força aplicada e a velocidade são ambas efetivamente zero
         if (Math.abs(this.appliedForce.x) < EPSILON && Math.abs(this.appliedForce.y) < EPSILON &&
             Math.abs(this.velocity.x) < EPSILON && Math.abs(this.velocity.y) < EPSILON) {
-            // Se ambas forem efetivamente zero, não há necessidade de atualizar a posição
             return;
         }
 
@@ -65,18 +91,21 @@ public class PhysicsObject {
         position.add(deltaVelocity);
         angularVelocity += angularAcceleration * deltaTime;
         angularAcceleration = 0; // Resetar após a atualização
+        
     }
+
 
     public boolean collidesWith(PhysicsObject other) {
         boolean collision = position.x < other.position.x + other.size.x &&
                             position.x + size.x > other.position.x &&
                             position.y < other.position.y + other.size.y &&
                             position.y + size.y > other.position.y;
-
+        /*
         if (collision) {
             if (flagLog) Log.d(LOG_NAME, "collidesWith - Colisão detectada: Obj1 Pos=" + this.position + " Size=" + this.size +
                   " Obj2 Pos=" + other.position + " Size=" + other.size);
         }
+        */
 
         return collision;
     }
@@ -110,6 +139,10 @@ public class PhysicsObject {
 
     public void setPosition(Vector2D position) {
         this.position = position;
+        
+        if (container != null) {
+            container.onParentUpdated(); // Atualizar a posição dos objetos filhos
+        }
     }
 
     public Vector2D getSize() {
@@ -138,6 +171,11 @@ public class PhysicsObject {
     
     public Vector2D getVelocity() {
         return velocity;
+    }
+    
+    public float getSpeed() {
+        // Retorna a magnitude do vetor de velocidade
+        return this.velocity.magnitude();
     }
 
     public float getAngularVelocity() {
@@ -169,4 +207,37 @@ public class PhysicsObject {
     public void setOnPlatform(boolean onPlatform) {
         this.onPlatform = onPlatform;
     }
+    
+    public void startOscillatingHorizontally(float amplitude, long oscillationTime) {
+        float frequency = 1.0f / oscillationTime; // Convertendo tempo em frequência
+        this.isOscillatingHorizontally = true;
+        this.oscillationAmplitudeX = amplitude;
+        this.oscillationFrequencyX = (float)(2 * Math.PI * frequency); // Convertendo para radianos por segundo
+        this.initialPosX = this.position.x;
+        this.startTime = System.currentTimeMillis();
+    }
+
+    public void startOscillatingVertically(float amplitude, long oscillationTime) {
+        float frequency = 1.0f / oscillationTime; // Convertendo tempo em frequência
+        this.isOscillatingVertically = true;
+        this.oscillationAmplitudeY = amplitude;
+        this.oscillationFrequencyY = (float)(2 * Math.PI * frequency); // Convertendo para radianos por segundo
+        this.initialPosY = this.position.y;
+        this.startTime = System.currentTimeMillis();
+    }
+    
+    //Conteiner setter and getter
+    // Método para definir o container
+    public void setContainer(Container container) {
+        this.container = container;
+        if (container != null) {
+            this.containerOffset = new Vector2D(this.position.x - container.getParent().getPosition().x,
+                                                this.position.y - container.getParent().getPosition().y);
+        }
+    }
+
+    public Vector2D getContainerOffset() {
+        return containerOffset;
+    }
+    
 }
