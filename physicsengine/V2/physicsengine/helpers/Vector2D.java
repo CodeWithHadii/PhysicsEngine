@@ -40,8 +40,7 @@ public class Vector2D {
         return this.x * other.x + this.y * other.y;
     }
 
-    public void subtract(Vector2D other) {
-        this.x -= other.x;
-        this.y -= other.y;
-    }
+    public Vector2D subtract(Vector2D other) {
+        return new Vector2D(this.x - other.x, this.y - other.y);
+    }    
 }

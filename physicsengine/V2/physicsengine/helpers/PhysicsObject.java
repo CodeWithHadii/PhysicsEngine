@@ -38,6 +38,8 @@ public class PhysicsObject {
     //Conteiner
     private Container container;
     private Vector2D containerOffset; // Offset relativo à posição do pai
+    
+    private int spriteId; // Identificador único para a sprite
 
     public PhysicsObject(float x, float y, float width, float height, float mass, float friction) {
         this.position = new Vector2D(x, y);

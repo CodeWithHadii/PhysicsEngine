@@ -15,6 +15,8 @@ import com.bosonshiggs.physicsengine.helpers.PhysicsObject;
 import com.bosonshiggs.physicsengine.helpers.Camera;
 import com.bosonshiggs.physicsengine.helpers.Container;
 import com.bosonshiggs.physicsengine.helpers.FollowInfo;
+import com.bosonshiggs.physicsengine.helpers.Sprite;
+import com.bosonshiggs.physicsengine.helpers.OriginPoint;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -46,6 +48,7 @@ import android.graphics.drawable.Drawable;
 import android.graphics.Matrix;
 import android.graphics.BitmapFactory;
 import android.graphics.Paint;
+import android.graphics.RectF;
 
 import android.content.Context;
 import android.view.View;
@@ -54,7 +57,7 @@ import android.view.ViewTreeObserver;
 import android.util.Log;
 
 @DesignerComponent(
-	    version = 1,
+	    version = 2,
 	    description = "The PhysicsEngine extension brings simple yet effective physics simulation.",
 	    category = ComponentCategory.EXTENSION,
 	    nonVisible = true,
@@ -66,6 +69,7 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
     private HashMap<Integer, String> objectToLayerMap = new HashMap<>();
     private HashMap<String, Runnable> animationTasks = new HashMap<>();
     private Map<Integer, Container> containers = new HashMap<>();
+    private Map<Integer, Sprite> sprites = new HashMap<>();
     
     // Mapa para armazenar os objetos que estão seguindo outros objetos
     private Map<Integer, FollowInfo> followingObjects = new HashMap<>();
@@ -76,7 +80,10 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
     private boolean flagLog = false;
     
     // Pool de threads para melhorar a eficiência
-    private ExecutorService collisionExecutor = Executors.newSingleThreadExecutor();    
+    private ExecutorService collisionExecutor = Executors.newSingleThreadExecutor();
+    private ExecutorService executor = Executors.newSingleThreadExecutor();
+    private ExecutorService touchEventExecutor = Executors.newSingleThreadExecutor();
+    private ExecutorService touchEventExecutorMs = Executors.newSingleThreadExecutor();
     
     private Handler uiHandler = new Handler(Looper.getMainLooper());
     
@@ -112,8 +119,20 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
     private Camera camera;
     
     private boolean isParallaxEnabled = true;
-        
-    private ExecutorService executor = Executors.newSingleThreadExecutor();
+    
+ // Variáveis globais para controlar a exibição das coordenadas e do FPS
+    private boolean showTouchInfo = false;
+    private float touchX = 0;
+    private float touchY = 0;
+    private long lastTouchTime = System.currentTimeMillis();
+    private float fps = 0;
+    
+    
+    //Dev mode
+    private RectF lastTouchBounds = new RectF();
+    
+    private Vector2D lastTouchPosition = new Vector2D(0, 0);
+    private boolean showTouchesAndBounds = false;
     
     public PhysicsEngine(ComponentContainer container) {
         super(container.$form());
@@ -278,6 +297,18 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
                 }
             }
             
+            // Atualizar as posições das sprites com base nos seus PhysicsObject
+            synchronized (this.sprites) {
+                for (Map.Entry<Integer, Sprite> entry : sprites.entrySet()) {
+                    PhysicsObject obj = objects.get(entry.getKey());
+                    Sprite sprite = entry.getValue();
+                    if (obj != null && sprite != null) {
+                        // Atualiza a sprite para refletir a nova posição do PhysicsObject
+                        sprite.updatePosition(obj.getPosition().x, obj.getPosition().y);
+                    }
+                }
+            }
+            
             // Atualiza o efeito de paralaxe para todas as camadas
             if (this.isParallaxEnabled) {
 	            for (Layer layer : layerMap.values()) {
@@ -325,6 +356,8 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
         // Se as caixas de colisão estão ativadas, redesenha o canvas com elas
         if (showCollisionBoxes) {
         	RedrawCanvas(-1, true);
+        } else {
+        	 RedrawCanvas(-1, showCollisionBoxes);
         }
         
         if (this.isParallaxEnabled) {
@@ -434,11 +467,26 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
     public void SetObjectPosition(int id, float x, float y) {
         PhysicsObject obj = objects.get(id);
         if (obj != null) {
-            obj.setPosition(new Vector2D(x, y));
-            updateOnPlatformState(obj);
+            // Obtém a sprite associada ao objeto de física
+            Sprite sprite = sprites.get(id);
             
-            // Atualiza o efeito de paralaxe relativo ao objeto
-            UpdateParallaxEffectRelativeToObject(id);
+            if (sprite != null) {
+                // Calcula a posição ajustada com base no ponto de origem da sprite
+                Vector2D originOffset = sprite.calculateOriginOffset();
+                
+                // Ajusta as coordenadas (x, y) para que o ponto de origem especificado da sprite esteja nessas coordenadas
+                float adjustedX = x + originOffset.x;
+                float adjustedY = y + originOffset.y;
+                
+                // Atualiza a posição do objeto de física
+                obj.setPosition(new Vector2D(adjustedX, adjustedY));
+            } else {
+                // Se não houver uma sprite associada, simplesmente atualiza a posição do objeto de física
+                obj.setPosition(new Vector2D(x, y));
+            }
+
+            // Atualiza o estado de estar sobre uma plataforma, se necessário
+            updateOnPlatformState(obj);
             
             // Se as caixas de colisão estão ativadas, redesenha o canvas com elas
             if (showCollisionBoxes) {
@@ -603,6 +651,18 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
         // Fecha o serviço executor para liberar recursos do sistema
         if (!collisionExecutor.isShutdown()) {
             collisionExecutor.shutdown();
+        }
+        
+        if (!touchEventExecutor.isShutdown()) {
+        	touchEventExecutor.shutdown();
+        }
+        
+        if (!touchEventExecutorMs.isShutdown()) {
+        	touchEventExecutorMs.shutdown();
+        }
+
+        if (!executor.isShutdown()) {
+        	executor.shutdown();
         }
         
         // Reciclar todos os bitmaps de camadas
@@ -1302,10 +1362,327 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
      * END FOLLOWING
      */
     
+    /*
+     * This PredictFinalPositions method calculates and returns a YailList, where each item is another YailList containing the object's ID 
+     * and its predicted final coordinates (x, y) after the specified time interval. It does this by applying the basic physics of uniformly 
+     * accelerated motion, accounting for acceleration due to applied forces and gravity. 
+     * This is a simplified example and does not take into account future collisions or changes in forces over time. 
+     * For more complex scenarios, such as predicting collisions or movements caused by interactions between objects, 
+     * you would need a more detailed simulation model.
+     */
+    /*
+     * Trajectory preview
+     */
+    @SimpleFunction(description = "Predicts the final positions of all objects after a given time interval.")
+    public YailList PredictFinalPositions(float timeInterval) {
+        ArrayList<YailList> finalPositions = new ArrayList<>();
+        for (Map.Entry<Integer, PhysicsObject> entry : objects.entrySet()) {
+            int id = entry.getKey();
+            PhysicsObject obj = entry.getValue();
+            
+            // Calcula a posição final baseada na velocidade atual e forças aplicadas
+            Vector2D finalPosition = calculateFinalPosition(obj, timeInterval);
+            
+            // Adiciona a posição final à lista de resultados
+            finalPositions.add(YailList.makeList(new Object[]{id, finalPosition.x, finalPosition.y}));
+        }
+        
+        return YailList.makeList(finalPositions);
+    }
+
+    // Método auxiliar para calcular a posição final de um objeto
+    private Vector2D calculateFinalPosition(PhysicsObject obj, float timeInterval) {
+        Vector2D acceleration = new Vector2D(obj.getAppliedForce().x / obj.getMass(), obj.getAppliedForce().y / obj.getMass());
+        acceleration.add(gravity); // Considera a gravidade
+        
+        // Calcula a posição final baseada na fórmula do movimento uniformemente acelerado
+        float finalX = obj.getPosition().x + obj.getVelocity().x * timeInterval + 0.5f * acceleration.x * timeInterval * timeInterval;
+        float finalY = obj.getPosition().y + obj.getVelocity().y * timeInterval + 0.5f * acceleration.y * timeInterval * timeInterval;
+        
+        return new Vector2D(finalX, finalY);
+    }
+    
+    @SimpleFunction(description = "Predicts the velocity of an object after a given time interval.")
+    public YailList PredictFinalVelocity(int objectId, float timeInterval) {
+        PhysicsObject obj = objects.get(objectId);
+        if (obj != null) {
+            Vector2D acceleration = new Vector2D(obj.getAppliedForce().x / obj.getMass(), obj.getAppliedForce().y / obj.getMass());
+            acceleration.add(gravity); // Considera a gravidade
+            
+            // Calcula a velocidade final
+            float finalVx = obj.getVelocity().x + acceleration.x * timeInterval;
+            float finalVy = obj.getVelocity().y + acceleration.y * timeInterval;
+            
+            return YailList.makeList(new Object[]{finalVx, finalVy});
+        }
+        return YailList.makeList(new Object[]{0f, 0f}); // Retorna velocidade zero se o objeto não for encontrado
+    }
+    
+    /*
+     * ANGLE
+     */
+    
+    @SimpleFunction(description = "Calculates the angle of an object's velocity vector relative to the horizontal axis.")
+    public float CalculateObjectAngle(int objectId) {
+        PhysicsObject obj = objects.get(objectId);
+        if (obj != null) {
+            Vector2D velocity = obj.getVelocity();
+            
+            // Calcula o ângulo em radianos
+            double angleRadians = Math.atan2(velocity.y, velocity.x);
+            
+            // Converte o ângulo para graus
+            double angleDegrees = Math.toDegrees(angleRadians);
+            
+            // Normaliza o ângulo para um intervalo de 0 a 360 graus
+            double normalizedAngle = (angleDegrees + 360) % 360;
+            
+            return (float)normalizedAngle;
+        }
+        return 0f; // Retorna 0 se o objeto não for encontrado
+    }
+    
+    @SimpleFunction(description = "Inverts the direction of an object upon collision.")
+    public void InvertObjectDirectionOnCollision(int objectId, String collisionSide) {
+        PhysicsObject obj = objects.get(objectId);
+        if (obj != null) {
+            switch (collisionSide.toLowerCase()) {
+                case "horizontal":
+                    // Inverte a direção horizontal (eixo X)
+                    obj.setVelocity(new Vector2D(-obj.getVelocity().x, obj.getVelocity().y));
+                    break;
+                case "vertical":
+                    // Inverte a direção vertical (eixo Y)
+                    obj.setVelocity(new Vector2D(obj.getVelocity().x, -obj.getVelocity().y));
+                    break;
+                case "both":
+                    // Inverte ambas as direções
+                    obj.setVelocity(new Vector2D(-obj.getVelocity().x, -obj.getVelocity().y));
+                    break;
+                default:
+                    // Se o lado da colisão não for reconhecido, não faz nada
+                    break;
+            }
+        }
+    }
+
+    @SimpleFunction(description = "Handles a collision by automatically detecting the collision side and inverting the object's direction accordingly.")
+    public void HandleCollisionAndInvertDirection(int objectId1, int objectId2) {
+        PhysicsObject obj1 = objects.get(objectId1);
+        PhysicsObject obj2 = objects.get(objectId2);
+        
+        if (obj1 != null && obj2 != null) {
+        	// Calcula o centro de massa de cada objeto
+            Vector2D center1 = new Vector2D(obj1.getPosition().x + obj1.getSize().x / 2, obj1.getPosition().y + obj1.getSize().y / 2);
+            Vector2D center2 = new Vector2D(obj2.getPosition().x + obj2.getSize().x / 2, obj2.getPosition().y + obj2.getSize().y / 2);
+            
+            // Calcula a diferença de posição entre os centros usando o método correto
+            Vector2D delta = center1.subtract(center2);
+            
+            // Determina a direção da colisão com base na diferença de posição e velocidade dos objetos
+            boolean horizontalCollision = Math.abs(delta.x) > Math.abs(delta.y);
+            boolean fromLeftOrRight = obj1.getVelocity().x * delta.x > 0;
+            boolean verticalCollision = !horizontalCollision;
+            boolean fromTopOrBottom = obj1.getVelocity().y * delta.y > 0;
+            
+            if (horizontalCollision && fromLeftOrRight) {
+                // Inverte a direção horizontal (eixo X)
+                obj1.setVelocity(new Vector2D(-obj1.getVelocity().x, obj1.getVelocity().y));
+            }
+            if (verticalCollision && fromTopOrBottom) {
+                // Inverte a direção vertical (eixo Y)
+                obj1.setVelocity(new Vector2D(obj1.getVelocity().x, -obj1.getVelocity().y));
+            }
+            
+            // Notifica a inversão da direção após a colisão
+            OnDirectionInverted(objectId1, horizontalCollision ? "horizontal" : "vertical");
+        }
+    }
+    
+    /*
+     * DYNAMICS SPRITES
+     */
+    
+    @SimpleFunction(description = "Creates an ImageSprite on a specified layer with initial configurations.")
+    public void CreateImageSpriteOnLayer(String layerName, @Asset String imagePath, int objectId, float x, float y, float width, float height) {
+        if (!layerMap.containsKey(layerName)) {
+            ReportError("Layer '" + layerName + "' not found.");
+            return;
+        }
+        
+        try {
+            Drawable drawable = MediaUtil.getBitmapDrawable(container.$form(), imagePath);
+            Bitmap imageBitmap = ((BitmapDrawable) drawable).getBitmap();
+            Bitmap resizedBitmap = Bitmap.createScaledBitmap(imageBitmap, (int)width, (int)height, true);
+            
+            // Cria um novo PhysicsObject para a sprite
+            PhysicsObject physicsObject = new PhysicsObject(x, y, width, height, 1.0f, 0.0f); // Ajuste massa e atrito conforme necessário
+            objects.put(objectId, physicsObject);
+            
+            // Cria e armazena o novo Sprite associado ao PhysicsObject
+            Sprite sprite = new Sprite(resizedBitmap, physicsObject);
+            sprites.put(objectId, sprite);
+
+            // Define o ponto de origem da Sprite no centro
+            sprite.setOriginPoint(OriginPoint.CENTER, null);
+
+            // Ajusta a posição da Sprite para que o ponto de origem esteja nas coordenadas (x, y)
+            float adjustedX = x - (width / 2);
+            float adjustedY = y - (height / 2);
+            physicsObject.setPosition(new Vector2D(adjustedX, adjustedY));
+            
+            RedrawCanvas(-1, showCollisionBoxes);
+            // Não é mais necessário chamar RedrawCanvas aqui, a atualização será gerenciada pelo sistema de física
+        } catch (Exception e) {
+            ReportError("Error loading or scaling image: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * Registra o toque na tela e verifica se ele interage com alguma sprite.
+     */
+    
+    @SimpleFunction(description = "Intercepts touches on Sprites and optionally shows touch bounds in Dev mode.")
+    public void RegisterTouchEvent(final float touchX, final float touchY, final boolean showTouches) {
+        touchEventExecutor.submit(new Runnable() {
+            @Override
+            public void run() {
+                lastTouchPosition = new Vector2D(touchX, touchY);
+                showTouchesAndBounds = showTouches;
+
+                boolean touchDetected = false;
+                for (Map.Entry<Integer, Sprite> entry : sprites.entrySet()) {
+                    Sprite sprite = entry.getValue();
+                    PhysicsObject physicsObject = sprite.getPhysicsObject();
+                    Vector2D position = physicsObject.getPosition();
+                    float width = physicsObject.getSize().x;
+                    float height = physicsObject.getSize().y;
+
+                    // Calcula os limites da sprite usando RectF
+                    RectF spriteBounds = sprite.getBounds();
+
+                    if (spriteBounds.contains(touchX, touchY)) {
+                        final int spriteId = entry.getKey();
+                        touchDetected = true;
+                        // Chama o evento OnSpriteTouched na thread principal
+                        uiHandler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                OnSpriteTouched(spriteId);
+                            }
+                        });
+                        break; // Para a iteração após o primeiro toque detectado para evitar múltiplos toques
+                    }
+                }
+
+                if (showTouches && touchDetected) {
+                    // Solicita um redesenho do canvas na thread principal
+                    uiHandler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            RedrawCanvas(-1, showCollisionBoxes);
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    /**
+     * Remove e destrói uma sprite baseada no seu ID. Atualiza o canvas para refletir a remoção.
+     * 
+     * @param spriteId O ID da sprite a ser removida.
+     */
+    @SimpleFunction(description = "Removes and destroys a sprite by its ID and updates the canvas.")
+    public void RemoveSprite(int spriteId) {
+        if (sprites.containsKey(spriteId)) {
+            sprites.remove(spriteId); // Remove a sprite do mapa
+            objects.remove(spriteId); // Remove o objeto de física associado
+            RedrawCanvas(-1, showCollisionBoxes); // Atualiza o canvas para refletir a remoção
+        } else {
+            ReportError("Sprite not found with ID: " + spriteId);
+        }
+    }
+    
+    @SimpleFunction(description = "Sets the origin point for a specific sprite.")
+    public void SetSpriteOriginPoint(int spriteId, @Options(OriginPoint.class) String originPointStr, float customX, float customY) {
+        Sprite sprite = sprites.get(spriteId);
+        if (sprite != null) {
+            // Usa o método fromUnderlyingValue para converter a string para o valor enum correspondente
+            OriginPoint op = OriginPoint.fromUnderlyingValue(originPointStr);
+            if (op != null) {
+                sprite.setOriginPoint(op, new Vector2D(customX, customY));
+            } else {
+                // Opção para lidar com um valor de string inválido, por exemplo, logar um erro ou lançar uma exceção
+                ReportError("Invalid origin point value: " + originPointStr);
+            }
+        }
+    }
+    
+    @SimpleFunction(description = "Registers a touch event on the canvas and displays touch coordinates and FPS.")
+    public void RegisterTouchAndDisplayInfo(final float touchX, final float touchY) {
+        touchEventExecutor.submit(new Runnable() {
+            @Override
+            public void run() {
+                PhysicsEngine.this.touchX = touchX;
+                PhysicsEngine.this.touchY = touchY;
+                PhysicsEngine.this.showTouchInfo = true;
+                updateFPS();
+
+                // Post na thread da UI para atualizar o canvas
+                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    @Override
+                    public void run() {
+                    	RedrawCanvas(-1, showCollisionBoxes);
+                    }
+                });
+
+                // Espera 500 ms para limpar as informações
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+
+                PhysicsEngine.this.showTouchInfo = false;
+
+                // Post na thread da UI para remover as informações do canvas
+                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    @Override
+                    public void run() {
+                    	RedrawCanvas(-1, showCollisionBoxes);
+                    }
+                });
+            }
+        });
+    }
+    
+    private void updateFPS() {
+        long currentTime = System.currentTimeMillis();
+        fps = 1000f / (currentTime - lastTouchTime);
+        lastTouchTime = currentTime;
+    }
+    
+    
 
     /*
      * EVENTS
      */
+    /**
+     * Evento disparado quando uma sprite é tocada.
+     * 
+     * @param spriteId O ID da sprite que foi tocada.
+     */
+    @SimpleEvent(description = "Event triggered when a sprite is touched.")
+    public void OnSpriteTouched(int spriteId) {
+        EventDispatcher.dispatchEvent(this, "OnSpriteTouched", spriteId);
+    }
+    
+    @SimpleEvent(description = "Event triggered when an object's direction is inverted after a collision.")
+    public void OnDirectionInverted(int objectId, String collisionSide) {
+        EventDispatcher.dispatchEvent(this, "OnDirectionInverted", objectId, collisionSide);
+    }
+    
     @SimpleEvent(description = "Triggered when the Canvas size changes.")
     public void CanvasSizeChanged(int width, int height) {
         EventDispatcher.dispatchEvent(this, "CanvasSizeChanged", width, height);
@@ -1516,10 +1893,20 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
                 return Integer.compare(l1.zIndex, l2.zIndex);
             }
         });
+        
         for (Layer layer : sortedLayers) {
             finalCanvas.drawBitmap(layer.bitmap, 0, 0, null);
         }
 
+        // Desenha as informações de toque e FPS se necessário
+        if (showTouchInfo) {
+        	paint.setColor(Color.BLACK);
+            paint.setTextSize(30); // Define o tamanho do texto
+            
+            finalCanvas.drawText("Touch: (" + touchX + ", " + touchY + ")", 10, 40, paint);
+            finalCanvas.drawText("FPS: " + String.format("%.2f", fps), 10, 80, paint);
+        }
+        
         // Desenha as caixas de colisão se necessário
         if (showCollisionBoxes) {
             paint.setColor(Color.RED);
@@ -1537,13 +1924,21 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
                 }
             } else {
                 // Desenha caixas de colisão para todos os objetos
+            	synchronized (this.objects) {
                 for (PhysicsObject obj : objects.values()) {
-                    Vector2D position = obj.getPosition();
-                    Vector2D size = obj.getSize();
-                    finalCanvas.drawRect((float) position.x, (float) position.y, 
-                                        (float) (position.x + size.x), (float) (position.y + size.y), paint);
-                }
+	                    Vector2D position = obj.getPosition();
+	                    Vector2D size = obj.getSize();
+	                    finalCanvas.drawRect((float) position.x, (float) position.y, 
+	                                        (float) (position.x + size.x), (float) (position.y + size.y), paint);
+	                }
+            	}
             }
+        }
+        
+        if (showTouchesAndBounds) {
+            // Visualiza os limites do último toque em modo Dev
+            paint.setColor(Color.GREEN);
+            finalCanvas.drawCircle((float) lastTouchPosition.x, (float) lastTouchPosition.y, 10, paint);
         }
         
         // Aplica o zoom da câmera
@@ -1551,6 +1946,36 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
 
         // Aplica a posição da câmera
         finalCanvas.translate(-camera.getPosition().x, -camera.getPosition().y);
+        
+        // Desenhar sprites
+        // Desenhar sprites e pontos de origem
+        synchronized (this.sprites) {
+            for (Sprite sprite : sprites.values()) {
+                sprite.draw(finalCanvas); // Desenha a sprite
+
+                if (showCollisionBoxes) {
+                    // Calcula o ponto de origem para a sprite atual
+                    Vector2D originOffset = sprite.calculateOriginOffset();
+                    Vector2D spritePosition = sprite.getPhysicsObject().getPosition();
+
+                    // Calcula a posição real do ponto de origem no canvas
+                    float originX = sprite.getOriginX();
+                    float originY = sprite.getOriginY();
+
+                    // Define a cor do Paint para azul antes de desenhar o ponto de origem
+                    paint.setColor(Color.BLUE);
+                    paint.setStyle(Paint.Style.FILL);
+                    finalCanvas.drawCircle(originX, originY, 5, paint); // Desenha o ponto de origem como um círculo pequeno
+                }
+            }
+        }
+
+        // Restaurar a cor e estilo do paint se necessário
+        if (showCollisionBoxes) {
+            paint.setColor(Color.RED);
+            paint.setStyle(Paint.Style.FILL);
+            finalCanvas.drawCircle(lastTouchPosition.x, lastTouchPosition.y, 10, paint);
+        }
 
         canvasComponent.getView().setBackground(new BitmapDrawable(context.getResources(), finalBitmap));
         canvasComponent.getView().invalidate();
