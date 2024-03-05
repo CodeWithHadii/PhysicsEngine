@@ -177,6 +177,16 @@ public class Sprite {
     public void setImage(Bitmap image) {
         this.image = image;
     }
+    
+    /**
+     * Obtém a imagem atual da sprite.
+     * 
+     * @return A imagem (`Bitmap`) da sprite.
+     */
+    public Bitmap getImage() {
+        return this.image;
+    }
+
 
     /**
      * Obtém o objeto de física associado à sprite.

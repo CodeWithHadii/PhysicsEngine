@@ -7,15 +7,26 @@ public class Vector2D {
         this.x = x;
         this.y = y;
     }
-
+    
     public void add(Vector2D other) {
         this.x += other.x;
         this.y += other.y;
     }
+    
+    public Vector2D add2D(Vector2D other) {
+        return new Vector2D(this.x + other.x, this.y + other.y);
+    }
 
-    public void multiply(float scalar) {
-        this.x *= scalar;
-        this.y *= scalar;
+    public Vector2D subtract2D(Vector2D other) {
+        return new Vector2D(this.x - other.x, this.y - other.y);
+    }
+
+    public Vector2D multiply(float scalar) {
+        return new Vector2D(this.x * scalar, this.y * scalar);
+    }
+
+    public Vector2D divide(float scalar) {
+        return new Vector2D(this.x / scalar, this.y / scalar);
     }
 
     public static float distance(Vector2D v1, Vector2D v2) {
@@ -38,9 +49,5 @@ public class Vector2D {
 
     public float dot(Vector2D other) {
         return this.x * other.x + this.y * other.y;
-    }
-
-    public Vector2D subtract(Vector2D other) {
-        return new Vector2D(this.x - other.x, this.y - other.y);
-    }    
+    }  
 }

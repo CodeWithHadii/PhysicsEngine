@@ -17,6 +17,7 @@ import com.bosonshiggs.physicsengine.helpers.Container;
 import com.bosonshiggs.physicsengine.helpers.FollowInfo;
 import com.bosonshiggs.physicsengine.helpers.Sprite;
 import com.bosonshiggs.physicsengine.helpers.OriginPoint;
+import com.bosonshiggs.physicsengine.helpers.QuadTree;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -29,8 +30,12 @@ import java.util.Collections;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ScheduledExecutorService;
+
+import java.util.Set;
+import java.util.HashSet;
 
 import android.os.Build;
 
@@ -50,11 +55,15 @@ import android.graphics.BitmapFactory;
 import android.graphics.Paint;
 import android.graphics.RectF;
 
+import android.app.Activity;
+
 import android.content.Context;
 import android.view.View;
 import android.view.ViewTreeObserver;
 
 import android.util.Log;
+
+import android.util.LruCache;
 
 @DesignerComponent(
 	    version = 2,
@@ -84,6 +93,9 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
     private ExecutorService executor = Executors.newSingleThreadExecutor();
     private ExecutorService touchEventExecutor = Executors.newSingleThreadExecutor();
     private ExecutorService touchEventExecutorMs = Executors.newSingleThreadExecutor();
+    private ExecutorService executorService = Executors.newCachedThreadPool();
+    
+    private ScheduledExecutorService scheduler;
     
     private Handler uiHandler = new Handler(Looper.getMainLooper());
     
@@ -134,6 +146,13 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
     private Vector2D lastTouchPosition = new Vector2D(0, 0);
     private boolean showTouchesAndBounds = false;
     
+    private Bitmap finalBitmap = null;
+    private Paint paint;
+    private final Object bitmapLock = new Object();
+    
+ // Inicializa o cache de bitmaps
+    private BitmapCache bitmapCache = new BitmapCache();
+    
     public PhysicsEngine(ComponentContainer container) {
         super(container.$form());
         this.container = container;
@@ -142,6 +161,11 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
         
      // Inicialize a câmera com valores padrão
         this.camera = new Camera(0, 0, 1.0f); // Posição (0,0) com zoom padrão 1
+        
+        scheduler = Executors.newSingleThreadScheduledExecutor();
+        
+     // Inicialização do PhysicsEngine...
+        paint = new Paint();
     }
     
     /*
@@ -175,28 +199,32 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
     /*
      * END PROPERTY
      */
-    
-    @SimpleFunction(description = "Starts periodic updates for the physics simulation.")
-    public void StartUpdates(int updateTimeMs) {
-        setupPeriodicUpdate(updateTimeMs);
+
+    public void shutdownScheduler() {
+        if (scheduler != null && !scheduler.isShutdown()) {
+            scheduler.shutdownNow();
+            try {
+                // Espera o termino das tarefas ou interrompe após um timeout
+                if (!scheduler.awaitTermination(60, TimeUnit.SECONDS)) {
+                    System.err.println("Executor não finalizou dentro do tempo.");
+                }
+            } catch (InterruptedException ie) {
+                // (Re)Cancela se a thread atual também for interrompida
+                scheduler.shutdownNow();
+                // Preserva o status de interrupção
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     @SimpleFunction(description = "Stops periodic updates for the physics simulation.")
     public void StopUpdates() {
-        updateHandler.removeCallbacks(updateTask);
+        if (updateTask != null) {
+            // Remove callbacks e mensagens para a tarefa de atualização
+            updateHandler.removeCallbacks(updateTask);
+        }
     }
-
-    private void setupPeriodicUpdate(final int updateTime) {
-        updateTask = new Runnable() {
-            @Override
-            public void run() {
-                update(updateTime/1000.0f); // Chama o método update com 10 milissegundos (0.01 segundos)
-                updateHandler.postDelayed(this, updateTime); // Reagenda o mesmo runnable para executar após 10 milissegundos
-            }
-        };
-        updateHandler.post(updateTask); // Inicia as atualizações periódicas
-    }
-    
+  
     @SimpleFunction(description = "Adds a physical object to the simulation with specified properties.")
     public void AddObject(int id, float x, float y, float width, float height, float mass, float friction) {
         objects.put(id, new PhysicsObject(x, y, width, height, mass, friction));
@@ -287,46 +315,127 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
      * BEGIN: Treat Physics individually for each object
      */
     //@SimpleFunction(description = "Updates the physics simulation, progressing time by the specified delta.")
-    public void update(float deltaTimeMs) {
-        final float deltaTime = deltaTimeMs / 1000;
+ // Método auxiliar para determinar se dois objetos estão próximos o suficiente para considerar colisão
+    @SimpleFunction(description = "Starts periodic updates for the physics simulation.")
+    public void StartUpdates(final int updateTimeMs) {
+        // Certifica-se de que o scheduler anterior seja fechado corretamente antes de criar um novo
+        shutdownScheduler();
 
+        // Cria um novo ScheduledExecutorService
+        scheduler = Executors.newSingleThreadScheduledExecutor();
+
+        // Agenda a tarefa de atualização
+        scheduler.scheduleAtFixedRate(new Runnable() {
+            @Override
+            public void run() {
+                // Sua lógica de atualização aqui
+                update(updateTimeMs / 1000.0f);
+            }
+        }, 0, updateTimeMs, TimeUnit.MILLISECONDS);
+    }
+    
+    private boolean areObjectsClose(PhysicsObject obj1, PhysicsObject obj2) {
+        float maxDistance = 100.0f; // Define o máximo de distância para considerar colisões
+        float dx = obj1.getPosition().x - obj2.getPosition().x;
+        float dy = obj1.getPosition().y - obj2.getPosition().y;
+        return (dx * dx + dy * dy) <= (maxDistance * maxDistance);
+    }
+    
+    public synchronized void update(final float deltaTimeMs) {
+        final float deltaTime = deltaTimeMs / 1000.0f;
         try {
+           if(flagLog) Log.d(LOG_NAME, "Iniciando a atualização do ciclo de física");
+
+            QuadTree.Rect bounds = new QuadTree.Rect(0, 0, canvasWidth, canvasHeight);
+            QuadTree quadTree = new QuadTree(0, bounds);
+
             synchronized (this.objects) {
-                for (PhysicsObject obj : objects.values()) {
+                for (PhysicsObject obj : new ArrayList<>(objects.values())) {
+                    quadTree.insert(obj);
+                }
+
+                for (PhysicsObject obj : new ArrayList<>(objects.values())) {
                     updateObject(obj, deltaTime);
                 }
             }
-            
-            // Atualizar as posições das sprites com base nos seus PhysicsObject
+
+            Set<String> checkedPairs = new HashSet<>();
+            synchronized (this.objects) {
+            	for (Map.Entry<Integer, PhysicsObject> entry : objects.entrySet()) {
+                    PhysicsObject obj1 = entry.getValue();
+                    List<PhysicsObject> candidates = quadTree.retrieve(new ArrayList<PhysicsObject>(), obj1);
+
+                    for (PhysicsObject obj2 : candidates) {
+                        if (obj1 == obj2) continue;
+                        
+                        String pairKey = Math.min(entry.getKey(), findObjectId(obj2)) + "-" + Math.max(entry.getKey(), findObjectId(obj2));
+                        if (!checkedPairs.add(pairKey)) continue;
+
+                        if (obj1.collidesWith(obj2)) {
+                            String collisionSide = determineCollisionSide(obj1, obj2);
+                            handleCollision(obj1, obj2, collisionSide);
+                        }
+                    }
+                }
+            }
+
+            if (isParallaxEnabled) {
+                synchronized (this.layerMap) {
+                    for (Layer layer : new ArrayList<>(layerMap.values())) {
+                        if (layer.parallaxIntensity > 0.0f) {
+                            updateLayerParallax(layer);
+                        }
+                    }
+                }
+            }
+
             synchronized (this.sprites) {
-                for (Map.Entry<Integer, Sprite> entry : sprites.entrySet()) {
-                    PhysicsObject obj = objects.get(entry.getKey());
+                for (Map.Entry<Integer, Sprite> entry : new HashMap<>(sprites).entrySet()) {
                     Sprite sprite = entry.getValue();
-                    if (obj != null && sprite != null) {
-                        // Atualiza a sprite para refletir a nova posição do PhysicsObject
+                    PhysicsObject obj = objects.get(entry.getKey());
+                    if (obj != null) {
                         sprite.updatePosition(obj.getPosition().x, obj.getPosition().y);
                     }
                 }
             }
             
-            // Atualiza o efeito de paralaxe para todas as camadas
-            if (this.isParallaxEnabled) {
-	            for (Layer layer : layerMap.values()) {
-	                if (layer.parallaxIntensity > 0.0f) {
-	                    updateLayerParallax(layer);
+            synchronized (this.objects) {
+	            for (PhysicsObject obj : objects.values()) {
+	                boolean onPlatform = false;
+	                for (PhysicsObject platform : objects.values()) {
+	                    if (platform.isPlatform() && obj.getPosition().y + obj.getSize().y <= platform.getPosition().y && Math.abs(obj.getPosition().x - platform.getPosition().x) < platform.getSize().x) {
+	                        onPlatform = true;
+	                        break;
+	                    }
 	                }
+	                obj.setOnPlatform(onPlatform);
 	            }
             }
-            
-            updateFollowing(deltaTime); // Atualiza o seguimento dos objetos
-            
-            OnUpdate();
+
+            updateFollowing(deltaTime);
+
+            if(flagLog) Log.d(LOG_NAME, "Finalizando a atualização do ciclo de física");
         } catch (Exception e) {
-            if (flagLog) Log.e(LOG_NAME, "Erro na atualização da física: " + e.getMessage());
+            Log.e(LOG_NAME, "Erro durante a atualização do ciclo de física", e);
+        } finally {
+            OnUpdate();
+        }
+    }
+    
+    private String determineCollisionSide(PhysicsObject obj1, PhysicsObject obj2) {
+        // Este é um exemplo simples. Você precisará ajustar a lógica com base na sua implementação específica
+        if (obj1.getPosition().x < obj2.getPosition().x) {
+            return "left";
+        } else if (obj1.getPosition().x > obj2.getPosition().x) {
+            return "right";
+        } else if (obj1.getPosition().y < obj2.getPosition().y) {
+            return "top";
+        } else {
+            return "bottom";
         }
     }
 
-    private void updateObject(PhysicsObject obj, float deltaTime) {
+    private synchronized void updateObject(PhysicsObject obj, float deltaTime) {
         // Atualiza o estado onPlatform do objeto
         updateOnPlatformState(obj);
 
@@ -346,12 +455,7 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
         // Dispara o evento de posição alterada
         final int objectId = findObjectId(obj);
         final Vector2D newPosition = obj.getPosition();
-        uiHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                OnPositionChanged(objectId, newPosition.x, newPosition.y);
-            }
-        });
+        OnPositionChanged(objectId, newPosition.x, newPosition.y);
         
         // Se as caixas de colisão estão ativadas, redesenha o canvas com elas
         if (showCollisionBoxes) {
@@ -363,6 +467,35 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
         if (this.isParallaxEnabled) {
             UpdateParallaxEffectRelativeToObject(objectId);
         }
+    }
+    
+    private void handleBilliardBallCollision(PhysicsObject obj1, PhysicsObject obj2) {
+        // Calcula o vetor normal da colisão
+        Vector2D collisionVector = obj1.getPosition().subtract2D(obj2.getPosition());
+        collisionVector.normalize();
+
+        // Calcula a diferença de velocidade
+        Vector2D velocityDifference = obj1.getVelocity().subtract2D(obj2.getVelocity());
+
+        // Calcula a velocidade relativa ao longo do vetor normal da colisão
+        float velocityAlongNormal = velocityDifference.dot(collisionVector);
+
+        // Não prossegue se os objetos estão se afastando
+        if (velocityAlongNormal > 0) {
+            return;
+        }
+
+        // Calcula o coeficiente de restituição (e = 1 para uma colisão perfeitamente elástica)
+        float restitution = 1.0f;
+
+        // Calcula o escalar de impulso que deve ser aplicado aos objetos
+        float j = -(1 + restitution) * velocityAlongNormal;
+        j /= (1 / obj1.getMass() + 1 / obj2.getMass());
+
+        // Aplica o impulso aos objetos
+        Vector2D impulse = collisionVector.multiply(j);
+        obj1.setVelocity(obj1.getVelocity().add2D(impulse.divide(obj1.getMass())));
+        obj2.setVelocity(obj2.getVelocity().subtract2D(impulse.divide(obj2.getMass())));
     }
 
     private void checkCollisionsForObject(PhysicsObject obj) {
@@ -665,6 +798,14 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
         	executor.shutdown();
         }
         
+        if (!executorService.isShutdown()) {
+            executorService.shutdownNow();
+        }
+        
+        if (scheduler != null && !scheduler.isShutdown()) {
+            scheduler.shutdownNow();
+        }
+        
         // Reciclar todos os bitmaps de camadas
         for (Layer layer : layerMap.values()) {
             recycleBitmap(layer.bitmap);
@@ -684,7 +825,7 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
     }
         
     @SimpleFunction(description = "Mirror an image horizontally.")
-    public String MirrorImageHorizontally(@Asset String imagePath) {
+    public synchronized String MirrorImageHorizontally(@Asset String imagePath) {
         try {
             Drawable drawable = MediaUtil.getBitmapDrawable(container.$form(), imagePath);
             Bitmap originalBitmap = ((BitmapDrawable) drawable).getBitmap();
@@ -712,7 +853,7 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
     }
 
     @SimpleFunction(description = "Mirror an image vertically.")
-    public String MirrorImageVertically(@Asset String imagePath) {
+    public synchronized String MirrorImageVertically(@Asset String imagePath) {
         try {
             Drawable drawable = MediaUtil.getBitmapDrawable(container.$form(), imagePath);
             Bitmap originalBitmap = ((BitmapDrawable) drawable).getBitmap();
@@ -740,7 +881,7 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
     }
     
     @SimpleFunction(description = "Start animating a sequence of images on a canvas object.")
-    public void StartAnimation(YailList imagePathsList, final int frameDurationMs, final String objectId) {
+    public synchronized void StartAnimation(YailList imagePathsList, final int frameDurationMs, final String objectId) {
         this.framePaths = convertYailListToStringList(imagePathsList);
         this.frameDurationMs = frameDurationMs;
         this.canvasObjectId = objectId;
@@ -782,12 +923,12 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
     }
     
     @SimpleFunction(description = "Check if there is an active animation for the specified object ID.")
-    public boolean IsAnimationActive(String objectId) {
+    public synchronized boolean IsAnimationActive(String objectId) {
         return animationTasks.containsKey(objectId);
     }
     
     @SimpleFunction(description = "Stop the animation with the specified ID.")
-    public void StopAnimation(String objectId) {
+    public synchronized void StopAnimation(String objectId) {
         Runnable taskToStop = animationTasks.get(objectId);
         if (taskToStop != null) {
             animationHandler.removeCallbacks(taskToStop);
@@ -1477,7 +1618,7 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
             Vector2D center2 = new Vector2D(obj2.getPosition().x + obj2.getSize().x / 2, obj2.getPosition().y + obj2.getSize().y / 2);
             
             // Calcula a diferença de posição entre os centros usando o método correto
-            Vector2D delta = center1.subtract(center2);
+            Vector2D delta = center1.subtract2D(center2);
             
             // Determina a direção da colisão com base na diferença de posição e velocidade dos objetos
             boolean horizontalCollision = Math.abs(delta.x) > Math.abs(delta.y);
@@ -1502,9 +1643,23 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
     /*
      * DYNAMICS SPRITES
      */
+    @SimpleFunction(description = "Sets the origin point for a specific sprite.")
+    public void SetSpriteOriginPoint(int spriteId, @Options(OriginPoint.class) String originPointStr, float customX, float customY) {
+        Sprite sprite = sprites.get(spriteId);
+        if (sprite != null) {
+            // Usa o método fromUnderlyingValue para converter a string para o valor enum correspondente
+            OriginPoint op = OriginPoint.fromUnderlyingValue(originPointStr);
+            if (op != null) {
+                sprite.setOriginPoint(op, new Vector2D(customX, customY));
+            } else {
+                // Opção para lidar com um valor de string inválido, por exemplo, logar um erro ou lançar uma exceção
+                ReportError("Invalid origin point value: " + originPointStr);
+            }
+        }
+    }
     
     @SimpleFunction(description = "Creates an ImageSprite on a specified layer with initial configurations.")
-    public void CreateImageSpriteOnLayer(String layerName, @Asset String imagePath, int objectId, float x, float y, float width, float height) {
+    public void CreateImageSpriteOnLayer(String layerName, @Options(OriginPoint.class) String originPointStr, @Asset String imagePath, int objectId, float x, float y, float width, float height, float mass, float friction) {
         if (!layerMap.containsKey(layerName)) {
             ReportError("Layer '" + layerName + "' not found.");
             return;
@@ -1516,7 +1671,7 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
             Bitmap resizedBitmap = Bitmap.createScaledBitmap(imageBitmap, (int)width, (int)height, true);
             
             // Cria um novo PhysicsObject para a sprite
-            PhysicsObject physicsObject = new PhysicsObject(x, y, width, height, 1.0f, 0.0f); // Ajuste massa e atrito conforme necessário
+            PhysicsObject physicsObject = new PhysicsObject(x, y, width, height, mass, friction); // Ajuste massa e atrito conforme necessário
             objects.put(objectId, physicsObject);
             
             // Cria e armazena o novo Sprite associado ao PhysicsObject
@@ -1524,7 +1679,8 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
             sprites.put(objectId, sprite);
 
             // Define o ponto de origem da Sprite no centro
-            sprite.setOriginPoint(OriginPoint.CENTER, null);
+            OriginPoint op = OriginPoint.fromUnderlyingValue(originPointStr);
+            sprite.setOriginPoint(op, null);
 
             // Ajusta a posição da Sprite para que o ponto de origem esteja nas coordenadas (x, y)
             float adjustedX = x - (width / 2);
@@ -1538,13 +1694,77 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
         }
     }
     
+    // Classe auxiliar para gerenciamento de cache de bitmaps
+    class BitmapCache {
+        private LruCache<String, Bitmap> cache;
+
+        public BitmapCache() {
+            final int maxMemory = (int) (Runtime.getRuntime().maxMemory() / 1024);
+            final int cacheSize = maxMemory / 8; // Usa 1/8 da memória disponível para cache
+
+            cache = new LruCache<String, Bitmap>(cacheSize) {
+                @Override
+                protected int sizeOf(String key, Bitmap bitmap) {
+                    return bitmap.getByteCount() / 1024;
+                }
+            };
+        }
+
+        public Bitmap getBitmapFromMemCache(String key) {
+            return cache.get(key);
+        }
+
+        public void addBitmapToMemoryCache(String key, Bitmap bitmap) {
+            if (getBitmapFromMemCache(key) == null) {
+                cache.put(key, bitmap);
+            }
+        }
+    }
+    
+    @SimpleFunction(description = "Changes the image of a sprite based on its ID.")
+    public void SetSpriteImage(final int spriteId, @Asset final String imagePath) {
+    	final Sprite sprite = sprites.get(spriteId);
+        if (sprite != null) {
+            // Executa na thread da UI
+            ((Activity) context).runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    Bitmap newImageBitmap = bitmapCache.getBitmapFromMemCache(imagePath);
+                    if (newImageBitmap == null) { // Se o bitmap não está no cache
+                        try {
+                            Drawable drawable = MediaUtil.getBitmapDrawable(container.$form(), imagePath);
+                            newImageBitmap = ((BitmapDrawable) drawable).getBitmap();
+                            bitmapCache.addBitmapToMemoryCache(imagePath, newImageBitmap);
+                        } catch (IOException e) {
+                            e.printStackTrace();
+                            ReportError("Error loading image: " + e.getMessage());
+                            return;
+                        }
+                    }
+
+                    // Recicla o bitmap antigo antes de substituir
+                    if (sprite.getImage() != null && !sprite.getImage().isRecycled()) {
+                        sprite.getImage().recycle();
+                    }
+
+                    // Atualiza a imagem da sprite
+                    sprite.setImage(newImageBitmap);
+                    RedrawCanvas(-1, showCollisionBoxes);
+                }
+            });
+        } else {
+            ReportError("Sprite not found with ID: " + spriteId);
+        }
+    }
+
+    
     /**
      * Registra o toque na tela e verifica se ele interage com alguma sprite.
      */
     
     @SimpleFunction(description = "Intercepts touches on Sprites and optionally shows touch bounds in Dev mode.")
     public void RegisterTouchEvent(final float touchX, final float touchY, final boolean showTouches) {
-        touchEventExecutor.submit(new Runnable() {
+    	Future<?> future = executorService.submit(new Runnable() {
             @Override
             public void run() {
                 lastTouchPosition = new Vector2D(touchX, touchY);
@@ -1601,21 +1821,6 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
             RedrawCanvas(-1, showCollisionBoxes); // Atualiza o canvas para refletir a remoção
         } else {
             ReportError("Sprite not found with ID: " + spriteId);
-        }
-    }
-    
-    @SimpleFunction(description = "Sets the origin point for a specific sprite.")
-    public void SetSpriteOriginPoint(int spriteId, @Options(OriginPoint.class) String originPointStr, float customX, float customY) {
-        Sprite sprite = sprites.get(spriteId);
-        if (sprite != null) {
-            // Usa o método fromUnderlyingValue para converter a string para o valor enum correspondente
-            OriginPoint op = OriginPoint.fromUnderlyingValue(originPointStr);
-            if (op != null) {
-                sprite.setOriginPoint(op, new Vector2D(customX, customY));
-            } else {
-                // Opção para lidar com um valor de string inválido, por exemplo, logar um erro ou lançar uma exceção
-                ReportError("Invalid origin point value: " + originPointStr);
-            }
         }
     }
     
@@ -1880,105 +2085,121 @@ public class PhysicsEngine extends AndroidNonvisibleComponent {
     /*
      * REDRAW
      */
-    public void RedrawCanvas(int objectId, boolean showCollisionBoxes) {
-        Bitmap finalBitmap = Bitmap.createBitmap(canvasWidth, canvasHeight, Bitmap.Config.ARGB_8888);
-        android.graphics.Canvas finalCanvas = new android.graphics.Canvas(finalBitmap);
-        Paint paint = new Paint();
-
-        // Ordena e desenha as camadas
-        List<Layer> sortedLayers = new ArrayList<>(layerMap.values());
-        Collections.sort(sortedLayers, new Comparator<Layer>() {
+    public synchronized void RedrawCanvas(final int objectId, final boolean showCollisionBoxes) {
+    	((Activity) context).runOnUiThread(new Runnable() {
             @Override
-            public int compare(Layer l1, Layer l2) {
-                return Integer.compare(l1.zIndex, l2.zIndex);
+	            public void run() {
+		    	synchronized (bitmapLock) {
+		            if (finalBitmap == null || finalBitmap.getWidth() != canvasWidth || finalBitmap.getHeight() != canvasHeight) {
+		                // Recicla o Bitmap antigo se não for nulo
+		                if (finalBitmap != null) {
+		                    finalBitmap.recycle();
+		                }
+		                finalBitmap = Bitmap.createBitmap(canvasWidth, canvasHeight, Bitmap.Config.ARGB_8888);
+		            }
+		        }
+		    	
+		    	android.graphics.Canvas finalCanvas = new android.graphics.Canvas(finalBitmap);
+		        paint.reset(); // Reseta o Paint para reutilização
+		
+		        // Ordena e desenha as camadas
+		        List<Layer> sortedLayers = new ArrayList<>(layerMap.values());
+		        Collections.sort(sortedLayers, new Comparator<Layer>() {
+		            @Override
+		            public int compare(Layer l1, Layer l2) {
+		                return Integer.compare(l1.zIndex, l2.zIndex);
+		            }
+		        });
+		        
+		        for (Layer layer : sortedLayers) {
+		            finalCanvas.drawBitmap(layer.bitmap, 0, 0, null);
+		        }
+		
+		        // Desenha as informações de toque e FPS se necessário
+		        if (showTouchInfo) {
+		        	paint.setColor(Color.BLACK);
+		            paint.setTextSize(30); // Define o tamanho do texto
+		            
+		            finalCanvas.drawText("Touch: (" + touchX + ", " + touchY + ")", 10, 40, paint);
+		            finalCanvas.drawText("FPS: " + String.format("%.2f", fps), 10, 80, paint);
+		        }
+		        
+		        // Desenha as caixas de colisão se necessário
+		        if (showCollisionBoxes) {
+		            paint.setColor(Color.RED);
+		            paint.setStyle(Paint.Style.STROKE);
+		            paint.setStrokeWidth(2);
+		
+		            if (objectId != -1) {
+		                // Desenha a caixa de colisão para um objeto específico
+		                PhysicsObject specificObj = objects.get(objectId);
+		                if (specificObj != null) {
+		                    Vector2D position = specificObj.getPosition();
+		                    Vector2D size = specificObj.getSize();
+		                    finalCanvas.drawRect((float) position.x, (float) position.y, 
+		                                        (float) (position.x + size.x), (float) (position.y + size.y), paint);
+		                }
+		            } else {
+		                // Desenha caixas de colisão para todos os objetos
+		            	//(this.objects) {
+		                for (PhysicsObject obj : objects.values()) {
+			                    Vector2D position = obj.getPosition();
+			                    Vector2D size = obj.getSize();
+			                    finalCanvas.drawRect((float) position.x, (float) position.y, 
+			                                        (float) (position.x + size.x), (float) (position.y + size.y), paint);
+		                }
+		            	//}
+		            }
+		        }
+		        
+		        if (showTouchesAndBounds) {
+		            // Visualiza os limites do último toque em modo Dev
+		            paint.setColor(Color.GREEN);
+		            finalCanvas.drawCircle((float) lastTouchPosition.x, (float) lastTouchPosition.y, 10, paint);
+		        }
+		        
+		        // Aplica o zoom da câmera
+		        finalCanvas.scale(camera.getZoom(), camera.getZoom());
+		
+		        // Aplica a posição da câmera
+		        finalCanvas.translate(-camera.getPosition().x, -camera.getPosition().y);
+		        
+		        // Desenhar sprites
+		        // Desenhar sprites e pontos de origem
+		        //(this.sprites) {
+		        for (Sprite sprite : sprites.values()) {
+		            sprite.draw(finalCanvas); // Desenha a sprite
+		
+		            if (showCollisionBoxes) {
+		                // Calcula o ponto de origem para a sprite atual
+		                Vector2D originOffset = sprite.calculateOriginOffset();
+		                Vector2D spritePosition = sprite.getPhysicsObject().getPosition();
+		
+		                // Calcula a posição real do ponto de origem no canvas
+		                float originX = sprite.getOriginX();
+		                float originY = sprite.getOriginY();
+		
+		                // Define a cor do Paint para azul antes de desenhar o ponto de origem
+		                paint.setColor(Color.BLUE);
+		                paint.setStyle(Paint.Style.FILL);
+		                finalCanvas.drawCircle(originX, originY, 5, paint); // Desenha o ponto de origem como um círculo pequeno
+		            }
+		        }
+		        //}
+		
+		        // Restaurar a cor e estilo do paint se necessário
+		        if (showCollisionBoxes) {
+		            paint.setColor(Color.RED);
+		            paint.setStyle(Paint.Style.FILL);
+		            finalCanvas.drawCircle(lastTouchPosition.x, lastTouchPosition.y, 10, paint);
+		        }
+		        
+		        
+			    canvasComponent.getView().setBackground(new BitmapDrawable(context.getResources(), finalBitmap));
+			    canvasComponent.getView().invalidate();
+       
             }
         });
-        
-        for (Layer layer : sortedLayers) {
-            finalCanvas.drawBitmap(layer.bitmap, 0, 0, null);
-        }
-
-        // Desenha as informações de toque e FPS se necessário
-        if (showTouchInfo) {
-        	paint.setColor(Color.BLACK);
-            paint.setTextSize(30); // Define o tamanho do texto
-            
-            finalCanvas.drawText("Touch: (" + touchX + ", " + touchY + ")", 10, 40, paint);
-            finalCanvas.drawText("FPS: " + String.format("%.2f", fps), 10, 80, paint);
-        }
-        
-        // Desenha as caixas de colisão se necessário
-        if (showCollisionBoxes) {
-            paint.setColor(Color.RED);
-            paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(2);
-
-            if (objectId != -1) {
-                // Desenha a caixa de colisão para um objeto específico
-                PhysicsObject specificObj = objects.get(objectId);
-                if (specificObj != null) {
-                    Vector2D position = specificObj.getPosition();
-                    Vector2D size = specificObj.getSize();
-                    finalCanvas.drawRect((float) position.x, (float) position.y, 
-                                        (float) (position.x + size.x), (float) (position.y + size.y), paint);
-                }
-            } else {
-                // Desenha caixas de colisão para todos os objetos
-            	synchronized (this.objects) {
-                for (PhysicsObject obj : objects.values()) {
-	                    Vector2D position = obj.getPosition();
-	                    Vector2D size = obj.getSize();
-	                    finalCanvas.drawRect((float) position.x, (float) position.y, 
-	                                        (float) (position.x + size.x), (float) (position.y + size.y), paint);
-	                }
-            	}
-            }
-        }
-        
-        if (showTouchesAndBounds) {
-            // Visualiza os limites do último toque em modo Dev
-            paint.setColor(Color.GREEN);
-            finalCanvas.drawCircle((float) lastTouchPosition.x, (float) lastTouchPosition.y, 10, paint);
-        }
-        
-        // Aplica o zoom da câmera
-        finalCanvas.scale(camera.getZoom(), camera.getZoom());
-
-        // Aplica a posição da câmera
-        finalCanvas.translate(-camera.getPosition().x, -camera.getPosition().y);
-        
-        // Desenhar sprites
-        // Desenhar sprites e pontos de origem
-        synchronized (this.sprites) {
-            for (Sprite sprite : sprites.values()) {
-                sprite.draw(finalCanvas); // Desenha a sprite
-
-                if (showCollisionBoxes) {
-                    // Calcula o ponto de origem para a sprite atual
-                    Vector2D originOffset = sprite.calculateOriginOffset();
-                    Vector2D spritePosition = sprite.getPhysicsObject().getPosition();
-
-                    // Calcula a posição real do ponto de origem no canvas
-                    float originX = sprite.getOriginX();
-                    float originY = sprite.getOriginY();
-
-                    // Define a cor do Paint para azul antes de desenhar o ponto de origem
-                    paint.setColor(Color.BLUE);
-                    paint.setStyle(Paint.Style.FILL);
-                    finalCanvas.drawCircle(originX, originY, 5, paint); // Desenha o ponto de origem como um círculo pequeno
-                }
-            }
-        }
-
-        // Restaurar a cor e estilo do paint se necessário
-        if (showCollisionBoxes) {
-            paint.setColor(Color.RED);
-            paint.setStyle(Paint.Style.FILL);
-            finalCanvas.drawCircle(lastTouchPosition.x, lastTouchPosition.y, 10, paint);
-        }
-
-        canvasComponent.getView().setBackground(new BitmapDrawable(context.getResources(), finalBitmap));
-        canvasComponent.getView().invalidate();
     }
     /*
      * REDRAW
